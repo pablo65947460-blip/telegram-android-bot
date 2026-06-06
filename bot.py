@@ -3,11 +3,10 @@ import os
 from functools import wraps
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 from fcm_sender import send_data_message
-
 
 load_dotenv()
 
@@ -20,132 +19,179 @@ LOGGER = logging.getLogger("android_remote_bot")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 
+# Nombres de dispositivos
+DEVICE_NAMES = {
+    1: "📱 Honor JDY-LX3",
+    2: "📱 Samsung SM-A715F",
+}
+
+def cargar_tokens():
+    tokens = {}
+    if "FCM_DEVICE_TOKEN" in os.environ:
+        tokens[1] = os.environ["FCM_DEVICE_TOKEN"]
+    i = 2
+    while True:
+        key = f"FCM_DEVICE_TOKEN_{i}"
+        if key in os.environ:
+            tokens[i] = os.environ[key]
+            i += 1
+        else:
+            break
+    return tokens
+
+TOKENS = cargar_tokens()
+seleccion = {}  # chat_id -> numero de dispositivo
 
 def admin_only(handler):
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat_id = update.effective_chat.id if update.effective_chat else None
-        if chat_id != ADMIN_CHAT_ID:
-            LOGGER.warning("Unauthorized Telegram chat_id=%s", chat_id)
-            if update.message:
-                await update.message.reply_text("Unauthorized.")
+        if update.effective_chat and update.effective_chat.id != ADMIN_CHAT_ID:
             return
         await handler(update, context)
-
     return wrapper
 
-
-def as_int(value: str, name: str, minimum: int = 0, maximum: int | None = None) -> int:
+async def send_command(chat_id, data):
+    num = seleccion.get(chat_id, 1)
+    token = TOKENS.get(num)
+    if not token:
+        return "❌ No hay token"
     try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer") from exc
-    if parsed < minimum:
-        raise ValueError(f"{name} must be >= {minimum}")
-    if maximum is not None and parsed > maximum:
-        raise ValueError(f"{name} must be <= {maximum}")
-    return parsed
-
-
-async def send(update: Update, data: dict[str, str]) -> None:
-    try:
-        message_id = await send_data_message(data)
-        await update.message.reply_text(f"Sent {data['command']} ({message_id})")
+        await send_data_message(data, token)
+        return f"✅ {data['command']} → {DEVICE_NAMES.get(num, f'Tel{num}')}"
     except Exception as exc:
-        LOGGER.exception("Failed to send FCM command")
-        await update.message.reply_text(f"FCM error: {exc}")
+        return f"❌ Error: {exc}"
 
+async def send_to_all(data):
+    results = []
+    for num, token in TOKENS.items():
+        try:
+            await send_data_message(data, token)
+            results.append(f"✅ {DEVICE_NAMES.get(num, f'Tel{num}')}")
+        except Exception as exc:
+            results.append(f"❌ Tel{num}: {exc}")
+    return "\n".join(results)
 
-@admin_only
-async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /app <name>")
-        return
-    await send(update, {"command": "app", "name": " ".join(context.args)})
+def menu_principal():
+    keyboard = [
+        [
+            InlineKeyboardButton("📱 Todos los dispositivos", callback_data="todos"),
+            InlineKeyboardButton("🎯 Seleccionar dispositivo", callback_data="seleccionar"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
+def menu_dispositivos():
+    keyboard = []
+    for num, nombre in DEVICE_NAMES.items():
+        keyboard.append([InlineKeyboardButton(nombre, callback_data=f"sel_{num}")])
+    keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="volver")])
+    return InlineKeyboardMarkup(keyboard)
 
-@admin_only
-async def tap_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /tap <x> <y>")
-        return
-    try:
-        x = as_int(context.args[0], "x")
-        y = as_int(context.args[1], "y")
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
-        return
-    await send(update, {"command": "tap", "x": str(x), "y": str(y)})
-
-
-@admin_only
-async def swipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) != 4:
-        await update.message.reply_text("Usage: /swipe <x1> <y1> <x2> <y2>")
-        return
-    try:
-        x1 = as_int(context.args[0], "x1")
-        y1 = as_int(context.args[1], "y1")
-        x2 = as_int(context.args[2], "x2")
-        y2 = as_int(context.args[3], "y2")
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
-        return
-    await send(update, {
-        "command": "swipe",
-        "x1": str(x1),
-        "y1": str(y1),
-        "x2": str(x2),
-        "y2": str(y2),
-    })
-
-
-@admin_only
-async def type_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /type <text>")
-        return
-    await send(update, {"command": "type", "text": " ".join(context.args)})
-
+def menu_control(modo="individual"):
+    keyboard = [
+        [
+            InlineKeyboardButton("🏠 Home", callback_data="cmd_home"),
+            InlineKeyboardButton("⬅️ Back", callback_data="cmd_back"),
+        ],
+        [
+            InlineKeyboardButton("📸 Screenshot", callback_data="cmd_screenshot"),
+            InlineKeyboardButton("🔒 Bloquear", callback_data="cmd_lock"),
+        ],
+        [
+            InlineKeyboardButton("🔊 Vol +", callback_data="cmd_vol_up"),
+            InlineKeyboardButton("🔉 Vol -", callback_data="cmd_vol_down"),
+        ],
+        [
+            InlineKeyboardButton("⬆️ Scroll arriba", callback_data="cmd_scroll_up"),
+            InlineKeyboardButton("⬇️ Scroll abajo", callback_data="cmd_scroll_down"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Volver", callback_data="volver"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 @admin_only
-async def simple_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    command = update.message.text.split()[0].replace("/", "", 1)
-    await send(update, {"command": command})
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🎮 *Panel de Control Android*\n\nSelecciona una opción:",
+        parse_mode="Markdown",
+        reply_markup=menu_principal()
+    )
 
 @admin_only
-async def volume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /volume <0-100>")
-        return
-    try:
-        value = as_int(context.args[0], "volume", 0, 100)
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
-        return
-    await send(update, {"command": "volume", "value": str(value)})
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
 
+    if data == "todos":
+        seleccion[chat_id] = "todos"
+        await query.edit_message_text(
+            "📱 *Modo: Todos los dispositivos*\nLos comandos se enviarán a todos.",
+            parse_mode="Markdown",
+            reply_markup=menu_control("todos")
+        )
+
+    elif data == "seleccionar":
+        await query.edit_message_text(
+            "🎯 *Selecciona un dispositivo:*",
+            parse_mode="Markdown",
+            reply_markup=menu_dispositivos()
+        )
+
+    elif data.startswith("sel_"):
+        num = int(data.split("_")[1])
+        seleccion[chat_id] = num
+        nombre = DEVICE_NAMES.get(num, f"Tel{num}")
+        await query.edit_message_text(
+            f"✅ *Dispositivo seleccionado:* {nombre}\n\nElige un comando:",
+            parse_mode="Markdown",
+            reply_markup=menu_control()
+        )
+
+    elif data == "volver":
+        await query.edit_message_text(
+            "🎮 *Panel de Control Android*\n\nSelecciona una opción:",
+            parse_mode="Markdown",
+            reply_markup=menu_principal()
+        )
+
+    elif data.startswith("cmd_"):
+        comando = data.replace("cmd_", "")
+        modo = seleccion.get(chat_id)
+
+        if comando == "vol_up":
+            payload = {"command": "volume", "value": "80"}
+        elif comando == "vol_down":
+            payload = {"command": "volume", "value": "20"}
+        elif comando == "scroll_up":
+            payload = {"command": "swipe", "x1": "540", "y1": "300", "x2": "540", "y2": "900"}
+        elif comando == "scroll_down":
+            payload = {"command": "swipe", "x1": "540", "y1": "900", "x2": "540", "y2": "300"}
+        else:
+            payload = {"command": comando}
+
+        if modo == "todos":
+            resultado = await send_to_all(payload)
+        else:
+            resultado = await send_command(chat_id, payload)
+
+        await query.edit_message_text(
+            f"{resultado}\n\nElige otro comando:",
+            reply_markup=menu_control(modo)
+        )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     LOGGER.exception("Telegram handler error", exc_info=context.error)
 
-
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("app", app_command))
-    app.add_handler(CommandHandler("tap", tap_command))
-    app.add_handler(CommandHandler("swipe", swipe_command))
-    app.add_handler(CommandHandler("type", type_command))
-    app.add_handler(CommandHandler("screenshot", simple_command))
-    app.add_handler(CommandHandler("home", simple_command))
-    app.add_handler(CommandHandler("back", simple_command))
-    app.add_handler(CommandHandler("lock", simple_command))
-    app.add_handler(CommandHandler("volume", volume_command))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(error_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
 if __name__ == "__main__":
     main()
-
