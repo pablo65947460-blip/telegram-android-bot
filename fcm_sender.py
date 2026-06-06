@@ -15,10 +15,12 @@ def init_firebase() -> None:
     firebase_admin.initialize_app(cred)
 
 
-async def send_data_message(data: dict[str, str]) -> str:
+async def send_data_message(data: dict[str, str], token: str = None) -> str:
     init_firebase()
+    if token is None:
+        token = os.environ["FCM_DEVICE_TOKEN"]
     message = messaging.Message(
-        token=os.environ["FCM_DEVICE_TOKEN"],
+        token=token,
         data={key: str(value) for key, value in data.items()},
         android=messaging.AndroidConfig(priority="high"),
     )
